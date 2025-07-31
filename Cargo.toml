@@ -1,0 +1,13 @@
+[package]
+name = "umbral-socket"
+version = "0.2.5"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alan-venv/umbral-socket"
+description = "Bytes server and client over Unix sockets "
+
+[dependencies]
+bytes = "1.10.1"
+futures = "0.3.31"
+deadpool = "0.12.2"
+tokio = { version = "1.46.1", features = ["full"] }

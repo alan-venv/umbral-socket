@@ -12,7 +12,7 @@ cargo add umbral-socket
 Below are basic examples for the server and client.
 
 ### Server
-Example of how to start a server that receives data, prints it to the console, and queues it in a SegQueue.
+Example of how to start a server that receives data, prints it to the console, and pushes it in a Vec.
 
 ```rust
 use std::{io::Result, sync::Arc};
@@ -31,12 +31,12 @@ async fn main() -> Result<()> {
     let state = State::default();
     let socket = "/tmp/umbral.sock";
     UmbralServer::new(state)
-        .route("POST", receive_user)
+        .route("POST", handler)
         .run(socket)
         .await
 }
 
-async fn receive_user(state: Arc<State>, content: Bytes) -> Result<Bytes> {
+async fn handler(state: Arc<State>, content: Bytes) -> Result<Bytes> {
     println!("CLIENT REQUEST: {}", String::from_utf8_lossy(&content));
     state.queue.lock().await.push(content);
     Ok(Bytes::from("OK"))

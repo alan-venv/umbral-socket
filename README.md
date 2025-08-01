@@ -23,7 +23,7 @@ use umbral_socket::stream::UmbralServer;
 
 #[derive(Clone, Default)]
 struct State {
-    queue: Arc<Mutex<Vec<Bytes>>>,
+    contents: Arc<Mutex<Vec<Bytes>>>,
 }
 
 #[tokio::main]
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
 
 async fn handler(state: Arc<State>, content: Bytes) -> Result<Bytes> {
     println!("CLIENT REQUEST: {}", String::from_utf8_lossy(&content));
-    state.queue.lock().await.push(content);
+    state.contents.lock().await.push(content);
     Ok(Bytes::from("OK"))
 }
 ```

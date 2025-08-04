@@ -59,8 +59,8 @@ impl<S: Send + Sync + 'static> UmbralServer<S> {
     }
 
     async fn handle_connection(&self, mut stream: UnixStream) -> Result<()> {
+        let mut buffer = [0u8; 1024];
         loop {
-            let mut buffer = [0; 1024];
             let n = match stream.read(&mut buffer).await {
                 Ok(0) => return Ok(()),
                 Ok(n) => n,

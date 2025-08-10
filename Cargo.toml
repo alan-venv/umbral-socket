@@ -1,6 +1,6 @@
 [package]
 name = "umbral-socket"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alan-venv/umbral-socket"
@@ -11,3 +11,8 @@ bytes = "1.10.1"
 futures = "0.3.31"
 deadpool = "0.12.2"
 tokio = { version = "1.46.1", features = ["full"] }
+
+[features]
+default = ["client-async"]
+client-async = []
+client-sync = []

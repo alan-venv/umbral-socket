@@ -6,7 +6,7 @@ use std::sync::{
 
 use bytes::Bytes;
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout;
 
 use crate::stream::protocol::{
@@ -83,6 +83,19 @@ impl UmbralClient {
         ))
     }
 
+    async fn acquire_slot(&self) -> MutexGuard<'_, Option<UnixStream>> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+
+        for offset in 0..self.slots.len() {
+            let index = (start + offset) % self.slots.len();
+            if let Ok(guard) = self.slots[index].stream.try_lock() {
+                return guard;
+            }
+        }
+
+        self.slots[start].stream.lock().await
+    }
+
     pub async fn send_raw(
         &self,
         method: MethodId,
@@ -95,9 +108,7 @@ impl UmbralClient {
             ));
         }
 
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        let slot = &self.slots[index];
-        let mut guard = slot.stream.lock().await;
+        let mut guard = self.acquire_slot().await;
 
         if guard.is_none() {
             *guard = Some(connect_with_timeout(self.socket.as_ref(), self.config).await?);

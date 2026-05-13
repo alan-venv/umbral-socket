@@ -2,6 +2,7 @@ use std::convert::TryFrom;
 use std::io;
 #[cfg(test)]
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -44,6 +45,9 @@ impl TryFrom<u8> for UmbralStatus {
 pub struct UmbralConfig {
     pub max_payload_len: usize,
     pub socket_permissions: u32,
+    pub connect_timeout: Duration,
+    pub write_timeout: Duration,
+    pub read_timeout: Duration,
 }
 
 impl Default for UmbralConfig {
@@ -51,6 +55,9 @@ impl Default for UmbralConfig {
         Self {
             max_payload_len: DEFAULT_MAX_PAYLOAD_LEN,
             socket_permissions: 0o766,
+            connect_timeout: Duration::from_millis(500),
+            write_timeout: Duration::from_millis(100),
+            read_timeout: Duration::from_millis(500),
         }
     }
 }

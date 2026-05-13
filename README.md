@@ -54,16 +54,21 @@ use bytes::Bytes;
 use umbral_socket::stream::UmbralClient;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let socket = "/tmp/umbral.sock";
-    let pool_size = 1;
-    let client = UmbralClient::new(socket, pool_size);
+    let connections = 8;
+    let client = UmbralClient::new(socket, connections).await?;
 
     let content = Bytes::from("{\"user\":\"alan\"}");
-    if let Ok(response) = client.send(1, content).await {
-        println!("SERVER RESPONSE: {}", String::from_utf8_lossy(&response))
-    }
+    let response = client.send(1, content).await?;
+
+    println!("SERVER RESPONSE: {}", String::from_utf8_lossy(&response));
+
+    Ok(())
 }
 ```
 
-Only the async `UmbralClient` is currently exposed.
+Only the async `UmbralClient` is currently exposed. It manages persistent
+connections internally for a single Unix socket. To talk to multiple servers,
+create one `UmbralClient` per server. `UmbralConfig` allows configuring the
+payload limit, socket permissions, and connect/write/read timeouts.

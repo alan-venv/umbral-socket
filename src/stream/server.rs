@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::future::Future;
 use std::io::Result;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -6,34 +6,42 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
+
+use super::protocol::{
+    MethodId, UmbralConfig, UmbralStatus, read_request_async, write_response_async,
+};
 
 type Handler<S> = Arc<dyn Fn(Arc<S>, Bytes) -> BoxFuture<'static, Result<Bytes>> + Send + Sync>;
 
 pub struct UmbralServer<S> {
     state: Arc<S>,
-    handlers: HashMap<String, Handler<S>>,
+    handlers: [Option<Handler<S>>; 256],
+    config: UmbralConfig,
 }
 
 impl<S: Send + Sync + 'static> UmbralServer<S> {
     pub fn new(state: S) -> Self {
+        Self::with_config(state, UmbralConfig::default())
+    }
+
+    pub fn with_config(state: S, config: UmbralConfig) -> Self {
         Self {
             state: Arc::new(state),
-            handlers: HashMap::new(),
+            handlers: std::array::from_fn(|_| None),
+            config,
         }
     }
 
-    pub fn route<F, Fut>(mut self, method: &str, handler: F) -> Self
+    pub fn route<F, Fut>(mut self, method: MethodId, handler: F) -> Self
     where
         F: Fn(Arc<S>, Bytes) -> Fut + Send + Sync + 'static,
-        Fut: futures::Future<Output = Result<Bytes>> + Send + 'static,
+        Fut: Future<Output = Result<Bytes>> + Send + 'static,
     {
         let handler_arc: Handler<S> =
             Arc::new(move |state, payload| Box::pin(handler(state, payload)));
-        self.handlers.insert(method.to_string(), handler_arc);
+        self.handlers[method as usize] = Some(handler_arc);
         self
     }
 
@@ -43,7 +51,7 @@ impl<S: Send + Sync + 'static> UmbralServer<S> {
             tokio::fs::remove_file(path).await?;
         }
         let listener = UnixListener::bind(path)?;
-        let permissions = std::fs::Permissions::from_mode(0o766);
+        let permissions = std::fs::Permissions::from_mode(self.config.socket_permissions);
         std::fs::set_permissions(path, permissions)?;
         let server_arc = Arc::new(self);
         println!("Umbral Server listening on \"{}\"", socket);
@@ -51,46 +59,41 @@ impl<S: Send + Sync + 'static> UmbralServer<S> {
             let (stream, _) = listener.accept().await?;
             let server_clone = server_arc.clone();
             tokio::spawn(async move {
-                if let Err(e) = server_clone.handle_connection(stream).await {
-                    eprintln!("Error processing connection: {}", e);
-                }
+                let _ = server_clone.handle_connection(stream).await;
             });
         }
     }
 
     async fn handle_connection(&self, mut stream: UnixStream) -> Result<()> {
-        let mut buffer = [0u8; 1024];
         loop {
-            let n = match stream.read(&mut buffer).await {
-                Ok(0) => return Ok(()),
-                Ok(n) => n,
-                Err(e) => return Err(e),
-            };
-            let message = String::from_utf8_lossy(&buffer[..n]);
+            let (method, payload) =
+                match read_request_async(&mut stream, self.config.max_payload_len).await {
+                    Ok(request) => request,
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        write_response_async(&mut stream, UmbralStatus::PayloadTooLarge, b"")
+                            .await?;
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
+                };
 
-            let response = if let Some((method, payload)) = message.trim().split_once("[%]") {
-                if let Some(handler) = self.handlers.get(method) {
-                    let state_clone = self.state.clone();
-                    let payload_bytes = Bytes::from(payload.as_bytes().to_vec());
-                    handler(state_clone, payload_bytes).await
-                } else {
-                    Ok(Bytes::from_static(b"METHOD NOT FOUND"))
-                }
-            } else {
-                Ok(Bytes::from_static(b"INVALID PROTOCOL"))
+            let Some(handler) = &self.handlers[method as usize] else {
+                write_response_async(&mut stream, UmbralStatus::MethodNotFound, b"").await?;
+                continue;
             };
 
-            match response {
+            let state_clone = self.state.clone();
+            match handler(state_clone, payload).await {
                 Ok(response_bytes) => {
-                    let len = response_bytes.len() as u32;
-                    stream.write_all(&len.to_be_bytes()).await?;
-                    stream.write_all(&response_bytes).await?;
+                    if response_bytes.len() > self.config.max_payload_len {
+                        write_response_async(&mut stream, UmbralStatus::HandlerError, b"").await?;
+                        continue;
+                    }
+                    write_response_async(&mut stream, UmbralStatus::Ok, &response_bytes).await?;
                 }
-                Err(e) => {
-                    let err_msg = Bytes::from(format!("Handler error: {}", e));
-                    let len = err_msg.len() as u32;
-                    stream.write_all(&len.to_be_bytes()).await?;
-                    stream.write_all(&err_msg).await?;
+                Err(_) => {
+                    write_response_async(&mut stream, UmbralStatus::HandlerError, b"").await?;
                 }
             }
         }

@@ -11,8 +11,3 @@ bytes = "1.10.1"
 futures = "0.3.31"
 deadpool = "0.12.2"
 tokio = { version = "1.46.1", features = ["full"] }
-
-[features]
-default = ["client-async"]
-client-async = []
-client-sync = []

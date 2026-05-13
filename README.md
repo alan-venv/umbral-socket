@@ -2,6 +2,9 @@
 
 Bytes server and client over Unix sockets.
 
+Umbral Socket uses a binary framed protocol over Unix stream sockets. Methods
+are identified by `u8`, and request/response payloads are `Bytes`.
+
 ## Installation
 ```bash
 cargo add umbral-socket
@@ -31,7 +34,7 @@ async fn main() -> Result<()> {
     let state = State::default();
     let socket = "/tmp/umbral.sock";
     UmbralServer::new(state)
-        .route("POST", handler)
+        .route(1, handler)
         .run(socket)
         .await
 }
@@ -57,8 +60,10 @@ async fn main() {
     let client = UmbralClient::new(socket, pool_size);
 
     let content = Bytes::from("{\"user\":\"alan\"}");
-    if let Ok(response) = client.send("POST", content).await {
+    if let Ok(response) = client.send(1, content).await {
         println!("SERVER RESPONSE: {}", String::from_utf8_lossy(&response))
     }
 }
 ```
+
+Only the async `UmbralClient` is currently exposed.

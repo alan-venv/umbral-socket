@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::timeout;
 
 use crate::stream::protocol::{
-    MethodId, UmbralConfig, UmbralStatus, read_response_async, write_request_async,
+    MethodId, UmbralConfig, UmbralStatus, read_response_into_async, write_request_async,
 };
 
 pub struct UmbralClient {
@@ -21,7 +21,12 @@ pub struct UmbralClient {
 }
 
 struct ConnectionSlot {
-    stream: Mutex<Option<UnixStream>>,
+    connection: Mutex<Option<Connection>>,
+}
+
+struct Connection {
+    stream: UnixStream,
+    response_buffer: Vec<u8>,
 }
 
 fn timed_out(operation: &'static str) -> io::Error {
@@ -35,6 +40,14 @@ async fn connect_with_timeout(socket: &str, config: UmbralConfig) -> io::Result<
     timeout(config.connect_timeout, UnixStream::connect(socket))
         .await
         .map_err(|_| timed_out("connect"))?
+}
+
+async fn connect_connection(socket: &str, config: UmbralConfig) -> io::Result<Connection> {
+    let stream = connect_with_timeout(socket, config).await?;
+    Ok(Connection {
+        stream,
+        response_buffer: Vec::new(),
+    })
 }
 
 impl UmbralClient {
@@ -58,9 +71,8 @@ impl UmbralClient {
         let mut slots = Vec::with_capacity(connections);
 
         for _ in 0..connections {
-            let stream = connect_with_timeout(socket.as_ref(), config).await?;
             slots.push(ConnectionSlot {
-                stream: Mutex::new(Some(stream)),
+                connection: Mutex::new(Some(connect_connection(socket.as_ref(), config).await?)),
             });
         }
 
@@ -83,17 +95,38 @@ impl UmbralClient {
         ))
     }
 
-    async fn acquire_slot(&self) -> MutexGuard<'_, Option<UnixStream>> {
+    pub async fn send_with<T, F>(
+        &self,
+        method: MethodId,
+        payload: &[u8],
+        handle: F,
+    ) -> io::Result<T>
+    where
+        F: FnOnce(&[u8]) -> io::Result<T>,
+    {
+        self.send_raw_with(method, payload, |status, body| {
+            if status == UmbralStatus::Ok {
+                return handle(body);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("umbral request failed with status {status:?}"),
+            ))
+        })
+        .await
+    }
+
+    async fn acquire_slot(&self) -> MutexGuard<'_, Option<Connection>> {
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
 
         for offset in 0..self.slots.len() {
             let index = (start + offset) % self.slots.len();
-            if let Ok(guard) = self.slots[index].stream.try_lock() {
+            if let Ok(guard) = self.slots[index].connection.try_lock() {
                 return guard;
             }
         }
 
-        self.slots[start].stream.lock().await
+        self.slots[start].connection.lock().await
     }
 
     pub async fn send_raw(
@@ -101,6 +134,21 @@ impl UmbralClient {
         method: MethodId,
         payload: Bytes,
     ) -> io::Result<(UmbralStatus, Bytes)> {
+        self.send_raw_with(method, payload.as_ref(), |status, body| {
+            Ok((status, Bytes::copy_from_slice(body)))
+        })
+        .await
+    }
+
+    pub async fn send_raw_with<T, F>(
+        &self,
+        method: MethodId,
+        payload: &[u8],
+        handle: F,
+    ) -> io::Result<T>
+    where
+        F: FnOnce(UmbralStatus, &[u8]) -> io::Result<T>,
+    {
         if payload.len() > self.config.max_payload_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -111,31 +159,40 @@ impl UmbralClient {
         let mut guard = self.acquire_slot().await;
 
         if guard.is_none() {
-            *guard = Some(connect_with_timeout(self.socket.as_ref(), self.config).await?);
+            *guard = Some(connect_connection(self.socket.as_ref(), self.config).await?);
         }
 
-        let stream = guard.as_mut().expect("slot stream must exist");
+        let connection = guard.as_mut().expect("slot connection must exist");
         let result = async {
             timeout(
                 self.config.write_timeout,
-                write_request_async(stream, method, &payload),
+                write_request_async(&mut connection.stream, method, payload),
             )
             .await
             .map_err(|_| timed_out("write"))??;
 
             timeout(
                 self.config.read_timeout,
-                read_response_async(stream, self.config.max_payload_len),
+                read_response_into_async(
+                    &mut connection.stream,
+                    self.config.max_payload_len,
+                    &mut connection.response_buffer,
+                ),
             )
             .await
             .map_err(|_| timed_out("read"))?
         }
         .await;
 
-        if result.is_err() {
-            *guard = None;
+        match result {
+            Ok(status) => {
+                let connection = guard.as_ref().expect("slot connection must exist");
+                handle(status, connection.response_buffer.as_slice())
+            }
+            Err(error) => {
+                *guard = None;
+                Err(error)
+            }
         }
-
-        result
     }
 }

@@ -1,19 +1,23 @@
-use std::future::Future;
-use std::io::Result;
+use std::io::{self, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures::future::BoxFuture;
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 
 use super::protocol::{
-    MethodId, UmbralConfig, UmbralStatus, read_request_async, write_response_async,
+    MethodId, UmbralConfig, UmbralStatus, read_request_into_async, write_response_async,
 };
 
-type Handler<S> = Arc<dyn Fn(Arc<S>, Bytes) -> BoxFuture<'static, Result<Bytes>> + Send + Sync>;
+pub enum UmbralResponse {
+    Empty,
+    RequestPayload,
+    ResponseBuffer,
+    Static(&'static [u8]),
+}
+
+type Handler<S> = Box<dyn Fn(&S, &[u8], &mut Vec<u8>) -> io::Result<UmbralResponse> + Send + Sync>;
 
 pub struct UmbralServer<S> {
     state: Arc<S>,
@@ -34,14 +38,11 @@ impl<S: Send + Sync + 'static> UmbralServer<S> {
         }
     }
 
-    pub fn route<F, Fut>(mut self, method: MethodId, handler: F) -> Self
+    pub fn route<F>(mut self, method: MethodId, handler: F) -> Self
     where
-        F: Fn(Arc<S>, Bytes) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Bytes>> + Send + 'static,
+        F: Fn(&S, &[u8], &mut Vec<u8>) -> io::Result<UmbralResponse> + Send + Sync + 'static,
     {
-        let handler_arc: Handler<S> =
-            Arc::new(move |state, payload| Box::pin(handler(state, payload)));
-        self.handlers[method as usize] = Some(handler_arc);
+        self.handlers[method as usize] = Some(Box::new(handler));
         self
     }
 
@@ -65,32 +66,46 @@ impl<S: Send + Sync + 'static> UmbralServer<S> {
     }
 
     async fn handle_connection(&self, mut stream: UnixStream) -> Result<()> {
+        let mut request_buffer = Vec::new();
+        let mut response_buffer = Vec::new();
+
         loop {
-            let (method, payload) =
-                match read_request_async(&mut stream, self.config.max_payload_len).await {
-                    Ok(request) => request,
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                        write_response_async(&mut stream, UmbralStatus::PayloadTooLarge, b"")
-                            .await?;
-                        return Ok(());
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                    Err(e) => return Err(e),
-                };
+            response_buffer.clear();
+            let method = match read_request_into_async(
+                &mut stream,
+                self.config.max_payload_len,
+                &mut request_buffer,
+            )
+            .await
+            {
+                Ok(method) => method,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    write_response_async(&mut stream, UmbralStatus::PayloadTooLarge, b"").await?;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e),
+            };
 
             let Some(handler) = &self.handlers[method as usize] else {
                 write_response_async(&mut stream, UmbralStatus::MethodNotFound, b"").await?;
                 continue;
             };
 
-            let state_clone = self.state.clone();
-            match handler(state_clone, payload).await {
-                Ok(response_bytes) => {
-                    if response_bytes.len() > self.config.max_payload_len {
+            match handler(self.state.as_ref(), &request_buffer, &mut response_buffer) {
+                Ok(response) => {
+                    let body = match response {
+                        UmbralResponse::Empty => b"".as_slice(),
+                        UmbralResponse::RequestPayload => request_buffer.as_slice(),
+                        UmbralResponse::ResponseBuffer => response_buffer.as_slice(),
+                        UmbralResponse::Static(bytes) => bytes,
+                    };
+
+                    if body.len() > self.config.max_payload_len {
                         write_response_async(&mut stream, UmbralStatus::HandlerError, b"").await?;
                         continue;
                     }
-                    write_response_async(&mut stream, UmbralStatus::Ok, &response_bytes).await?;
+                    write_response_async(&mut stream, UmbralStatus::Ok, body).await?;
                 }
                 Err(_) => {
                     write_response_async(&mut stream, UmbralStatus::HandlerError, b"").await?;

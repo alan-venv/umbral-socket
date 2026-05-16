@@ -7,4 +7,4 @@ pub use protocol::{
     DEFAULT_MAX_PAYLOAD_LEN, MethodId, REQUEST_HEADER_LEN, RESPONSE_HEADER_LEN, UmbralConfig,
     UmbralStatus,
 };
-pub use server::UmbralServer;
+pub use server::{UmbralResponse, UmbralServer};

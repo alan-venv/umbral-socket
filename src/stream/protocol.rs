@@ -91,12 +91,26 @@ pub async fn read_request_async<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let mut payload = Vec::new();
+    let method = read_request_into_async(reader, max_payload_len, &mut payload).await?;
+    Ok((method, Bytes::from(payload)))
+}
+
+pub async fn read_request_into_async<R>(
+    reader: &mut R,
+    max_payload_len: usize,
+    payload: &mut Vec<u8>,
+) -> io::Result<MethodId>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0u8; REQUEST_HEADER_LEN];
     reader.read_exact(&mut header).await?;
     let len = payload_len_from_header(&header, max_payload_len)?;
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
-    Ok((header[0], Bytes::from(payload)))
+    payload.clear();
+    payload.resize(len, 0);
+    reader.read_exact(payload).await?;
+    Ok(header[0])
 }
 
 pub async fn write_request_async<W>(
@@ -123,13 +137,27 @@ pub async fn read_response_async<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let mut payload = Vec::new();
+    let status = read_response_into_async(reader, max_payload_len, &mut payload).await?;
+    Ok((status, Bytes::from(payload)))
+}
+
+pub async fn read_response_into_async<R>(
+    reader: &mut R,
+    max_payload_len: usize,
+    payload: &mut Vec<u8>,
+) -> io::Result<UmbralStatus>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0u8; RESPONSE_HEADER_LEN];
     reader.read_exact(&mut header).await?;
     let status = UmbralStatus::try_from(header[0])?;
     let len = payload_len_from_header(&header, max_payload_len)?;
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
-    Ok((status, Bytes::from(payload)))
+    payload.clear();
+    payload.resize(len, 0);
+    reader.read_exact(payload).await?;
+    Ok(status)
 }
 
 pub async fn write_response_async<W>(
@@ -337,5 +365,83 @@ mod tests {
             writer.await.unwrap(),
             (UmbralStatus::Ok, Bytes::from_static(b"ping"))
         );
+    }
+
+    #[tokio::test]
+    async fn read_request_into_async_reads_payload() {
+        let mut buffer = Vec::new();
+        write_request_sync(&mut buffer, 11, b"payload").unwrap();
+        let mut cursor = Cursor::new(buffer);
+        let mut payload = Vec::new();
+
+        let method = read_request_into_async(&mut cursor, DEFAULT_MAX_PAYLOAD_LEN, &mut payload)
+            .await
+            .unwrap();
+
+        assert_eq!(method, 11);
+        assert_eq!(payload, b"payload");
+    }
+
+    #[tokio::test]
+    async fn read_request_into_async_reuses_vec_capacity() {
+        let mut buffer = Vec::new();
+        write_request_sync(&mut buffer, 12, b"abc").unwrap();
+        let mut cursor = Cursor::new(buffer);
+        let mut payload = Vec::with_capacity(128);
+        let capacity = payload.capacity();
+
+        read_request_into_async(&mut cursor, DEFAULT_MAX_PAYLOAD_LEN, &mut payload)
+            .await
+            .unwrap();
+
+        assert_eq!(payload, b"abc");
+        assert_eq!(payload.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn read_request_into_async_rejects_oversize_before_reading_payload() {
+        let mut buffer = Vec::new();
+        write_request_sync(&mut buffer, 13, b"12345").unwrap();
+        let mut cursor = Cursor::new(buffer);
+        let mut payload = Vec::new();
+
+        let err = read_request_into_async(&mut cursor, 4, &mut payload)
+            .await
+            .expect_err("oversize payload must fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(payload.is_empty());
+        assert_eq!(cursor.position(), REQUEST_HEADER_LEN as u64);
+    }
+
+    #[tokio::test]
+    async fn read_response_into_async_reads_status_and_payload() {
+        let mut buffer = Vec::new();
+        write_response_sync(&mut buffer, UmbralStatus::Ok, b"done").unwrap();
+        let mut cursor = Cursor::new(buffer);
+        let mut payload = Vec::new();
+
+        let status = read_response_into_async(&mut cursor, DEFAULT_MAX_PAYLOAD_LEN, &mut payload)
+            .await
+            .unwrap();
+
+        assert_eq!(status, UmbralStatus::Ok);
+        assert_eq!(payload, b"done");
+    }
+
+    #[tokio::test]
+    async fn read_response_into_async_rejects_oversize() {
+        let mut buffer = Vec::new();
+        write_response_sync(&mut buffer, UmbralStatus::Ok, b"12345").unwrap();
+        let mut cursor = Cursor::new(buffer);
+        let mut payload = Vec::new();
+
+        let err = read_response_into_async(&mut cursor, 4, &mut payload)
+            .await
+            .expect_err("oversize response must fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(payload.is_empty());
+        assert_eq!(cursor.position(), RESPONSE_HEADER_LEN as u64);
     }
 }
